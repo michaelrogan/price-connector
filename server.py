@@ -15,6 +15,11 @@ Tools:
   * dividends     -> dividend history + trailing-12-mo total + indicated yield
                      (Income yield / yield-trap signal)
   * valuation     -> BEST-EFFORT multiples (market cap, P/E, div yield). See note.
+  * options_chain -> SURGE-ready options read: S3 gamma bin (call vol/OI), R5
+                     put/call short-proxy + ATM IV, gamma ramp above spot, and
+                     a naive dealer-GEX estimate (UW-2). CBOE delayed quotes
+                     primary (no auth, all expiries, greeks included); Yahoo
+                     options fallback (crumb-gated, BS gamma from IV).
 
 THE TWO THINGS THAT SHAPE THIS BUILD (per the blueprint + the live API reality):
   1. Yahoo has NO official API. Its v8 CHART endpoint still works without auth
@@ -68,7 +73,10 @@ USER_AGENT = os.environ.get(
 YCHART = "https://query1.finance.yahoo.com/v8/finance/chart"
 YSUM = "https://query1.finance.yahoo.com/v10/finance/quoteSummary"
 YCRUMB = "https://query1.finance.yahoo.com/v1/test/getcrumb"
+YOPTS = "https://query1.finance.yahoo.com/v7/finance/options"
+CBOE_OPTS = "https://cdn.cboe.com/api/global/delayed_quotes/options"
 STOOQ = "https://stooq.com/q/d/l/"
+RISK_FREE = float(os.environ.get("PRICE_RISK_FREE", "0.04"))  # for BS gamma fallback
 
 # Host-header fix (same as your other hosted connectors).
 _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -206,8 +214,243 @@ def _summarize(obs: list[dict]) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Options data sources (CBOE primary — one unauthenticated call, includes
+# greeks; Yahoo fallback — needs the crumb dance and one call per expiry)
+# ----------------------------------------------------------------------------
+
+import math
+import re
+
+_OCC = re.compile(r"^([A-Z.]{1,6})(\d{6})([CP])(\d{8})$")
+
+
+def _parse_occ(sym: str) -> dict | None:
+    """'GME261218C00025000' -> {expiry, type, strike}."""
+    m = _OCC.match(sym.replace(" ", ""))
+    if not m:
+        return None
+    _, ymd, cp, strike8 = m.groups()
+    try:
+        expiry = datetime.strptime(ymd, "%y%m%d").date().isoformat()
+    except ValueError:
+        return None
+    return {"expiry": expiry, "type": "call" if cp == "C" else "put",
+            "strike": int(strike8) / 1000.0}
+
+
+def _bs_gamma(spot: float, strike: float, iv: float, t_years: float,
+              r: float = RISK_FREE) -> float | None:
+    """Black-Scholes gamma (same for calls and puts). Used only when the
+    source doesn't supply gamma (Yahoo path)."""
+    if not all([spot and spot > 0, strike and strike > 0,
+                iv and iv > 0, t_years and t_years > 0]):
+        return None
+    try:
+        d1 = (math.log(spot / strike) + (r + iv * iv / 2.0) * t_years) / (iv * math.sqrt(t_years))
+        npdf = math.exp(-d1 * d1 / 2.0) / math.sqrt(2.0 * math.pi)
+        return npdf / (spot * iv * math.sqrt(t_years))
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
+async def _cboe_options(symbol: str) -> dict:
+    """All listed contracts in one call. Returns {spot, contracts:[...]} with
+    each contract: {expiry, type, strike, volume, oi, iv, gamma}."""
+    await _limiter.wait()
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": USER_AGENT},
+                                 follow_redirects=True) as c:
+        r = await c.get(f"{CBOE_OPTS}/{symbol.upper()}.json")
+        r.raise_for_status()
+        data = r.json()
+    d = (data or {}).get("data") or {}
+    spot = _num(d.get("close")) or _num(d.get("current_price"))
+    contracts = []
+    for o in d.get("options") or []:
+        meta = _parse_occ(str(o.get("option", "")))
+        if not meta:
+            continue
+        iv = _num(o.get("iv"))
+        if iv is not None and iv > 5:      # some feeds report 45.2 not 0.452
+            iv = iv / 100.0
+        contracts.append({**meta,
+                          "volume": _num(o.get("volume")) or 0.0,
+                          "oi": _num(o.get("open_interest")) or 0.0,
+                          "iv": iv,
+                          "gamma": _num(o.get("gamma"))})
+    if not contracts:
+        raise ValueError("CBOE returned no parseable contracts")
+    return {"source": "cboe", "spot": spot, "contracts": contracts}
+
+
+async def _yahoo_options(symbol: str, max_expiries: int = 3) -> dict:
+    """Crumb-authenticated Yahoo path; one request per expiry, capped."""
+    sym = symbol.upper()
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": USER_AGENT},
+                                 follow_redirects=True) as c:
+        for seed in ("https://fc.yahoo.com", "https://finance.yahoo.com"):
+            try:
+                await c.get(seed)
+                break
+            except Exception:
+                continue
+        await _limiter.wait()
+        crumb = (await c.get(YCRUMB)).text.strip()
+        if not crumb or "<" in crumb:
+            raise ValueError("could not obtain crumb")
+
+        async def _one(date_epoch: int | None) -> dict:
+            await _limiter.wait()
+            params: dict[str, Any] = {"crumb": crumb}
+            if date_epoch:
+                params["date"] = date_epoch
+            r = await c.get(f"{YOPTS}/{sym}", params=params)
+            r.raise_for_status()
+            res = (((r.json() or {}).get("optionChain") or {}).get("result") or [None])[0]
+            if not res:
+                raise ValueError("empty optionChain")
+            return res
+
+        first = await _one(None)
+        spot = _num(_raw((first.get("quote") or {}).get("regularMarketPrice")))
+        expiries = (first.get("expirationDates") or [])[:max_expiries]
+        blocks = [first]
+        for ep in expiries[1:]:
+            try:
+                blocks.append(await _one(ep))
+            except Exception:
+                break
+        contracts = []
+        for b in blocks:
+            for grp in b.get("options") or []:
+                ep = grp.get("expirationDate")
+                if not ep:
+                    continue
+                expiry = datetime.fromtimestamp(ep, tz=timezone.utc).date().isoformat()
+                for side, typ in (("calls", "call"), ("puts", "put")):
+                    for o in grp.get(side) or []:
+                        contracts.append({
+                            "expiry": expiry, "type": typ,
+                            "strike": _num(_raw(o.get("strike"))),
+                            "volume": _num(_raw(o.get("volume"))) or 0.0,
+                            "oi": _num(_raw(o.get("openInterest"))) or 0.0,
+                            "iv": _num(_raw(o.get("impliedVolatility"))),
+                            "gamma": None,
+                        })
+    if not contracts:
+        raise ValueError("Yahoo returned no contracts")
+    return {"source": "yahoo", "spot": spot, "contracts": contracts}
+
+
+def _derive_options_read(spot: float | None, contracts: list[dict],
+                         window_days: int) -> dict:
+    """The SURGE-ready derived fields: S3 gamma bin, R5 put/call proxy,
+    gamma ramp, and a naive dealer-GEX estimate."""
+    today = date.today()
+    horizon = today + timedelta(days=window_days)
+    window = [k for k in contracts
+              if k.get("strike") and k["expiry"] >= today.isoformat()
+              and k["expiry"] <= horizon.isoformat()]
+    if not window:
+        window = [k for k in contracts if k["expiry"] >= today.isoformat()]
+    calls = [k for k in window if k["type"] == "call"]
+    puts = [k for k in window if k["type"] == "put"]
+
+    cv = sum(k["volume"] for k in calls)
+    coi = sum(k["oi"] for k in calls)
+    pv = sum(k["volume"] for k in puts)
+    poi = sum(k["oi"] for k in puts)
+
+    ratio = round(cv / coi, 3) if coi else None
+    if ratio is None:
+        s3_pts, s3_rule = None, "call OI is zero/unreported — cannot bin"
+    elif ratio > 2:
+        s3_pts, s3_rule = 19, "> 2x"
+    elif ratio >= 1.5:
+        s3_pts, s3_rule = 13, "1.5-2x"
+    elif ratio >= 1.0:
+        s3_pts, s3_rule = 7, "1-1.5x"
+    else:
+        s3_pts, s3_rule = 0, "< 1x"
+
+    pc_vol = round(pv / cv, 3) if cv else None
+    pc_oi = round(poi / coi, 3) if coi else None
+    if pc_vol is None:
+        r5_read = "no call volume — P/C undefined"
+    elif pc_vol > 1.2:
+        r5_read = ("P/C > 1.2 — IF IV is flat/declining vs your archived "
+                   "snapshot, treat as institutional shorting (+1 S1 bin)")
+    elif pc_vol < 0.6:
+        r5_read = "P/C < 0.6 — bullish positioning / shorts may be covering"
+    else:
+        r5_read = "P/C 0.6-1.2 — neutral, standard S1 scoring"
+
+    atm_ivs = []
+    if spot:
+        for k in window:
+            if k.get("iv") and abs(k["strike"] - spot) / spot <= 0.05:
+                atm_ivs.append(k["iv"])
+    atm_iv = round(sum(atm_ivs) / len(atm_ivs) * 100, 1) if atm_ivs else None
+
+    ramp_pct, top_strikes = None, []
+    if spot and coi:
+        above = [k for k in calls if spot < k["strike"] <= spot * 1.3]
+        ramp_pct = round(sum(k["oi"] for k in above) / coi * 100, 1)
+        by_strike: dict[float, float] = {}
+        for k in calls:
+            by_strike[k["strike"]] = by_strike.get(k["strike"], 0.0) + k["oi"]
+        top_strikes = [{"strike": s, "call_oi": int(o)} for s, o in
+                       sorted(by_strike.items(), key=lambda x: -x[1])[:3]]
+
+    gex, gex_n = 0.0, 0
+    if spot:
+        for k in window:
+            g = k.get("gamma")
+            if g is None and k.get("iv"):
+                t = (date.fromisoformat(k["expiry"]) - today).days / 365.0
+                g = _bs_gamma(spot, k["strike"], k["iv"], max(t, 1 / 365.0))
+            if g is None or not k["oi"]:
+                continue
+            sign = 1.0 if k["type"] == "call" else -1.0
+            gex += sign * g * k["oi"] * 100.0 * spot * spot * 0.01
+            gex_n += 1
+    gex_out = None
+    if gex_n:
+        gex_out = {
+            "gex_usd_per_1pct_move": round(gex),
+            "sign": "positive" if gex > 0 else "negative",
+            "contracts_used": gex_n,
+            "caveat": ("Naive dealer model (dealers long calls / short puts). In "
+                       "squeeze names where RETAIL is the call buyer, dealers are "
+                       "short calls and the sign interpretation INVERTS. Use the "
+                       "day-over-day FLIP (UW-2), not the level, and archive "
+                       "snapshots to see it."),
+        }
+
+    return {
+        "window_days": window_days,
+        "contracts_in_window": len(window),
+        "expiries_in_window": sorted({k["expiry"] for k in window}),
+        "s3_gamma": {"call_volume": int(cv), "call_open_interest": int(coi),
+                     "call_vol_oi_ratio": ratio, "s3_points": s3_pts,
+                     "bin": s3_rule, "max_points_note":
+                     "S3 gamma sub-component only (max 19); ETF mechanical "
+                     "+8 is scored separately from holdings data"},
+        "short_proxy_r5": {"put_call_volume_ratio": pc_vol,
+                           "put_call_oi_ratio": pc_oi,
+                           "atm_iv_pct": atm_iv, "read": r5_read,
+                           "iv_trend_note": "IV TREND needs two snapshots — "
+                           "archive atm_iv_pct daily; R5 fires on P/C > 1.2 "
+                           "with flat/declining IV."},
+        "gamma_ramp": {"pct_call_oi_0_to_30pct_above_spot": ramp_pct,
+                       "top_call_oi_strikes": top_strikes},
+        "dealer_gex_estimate": gex_out,
+    }
+
+
+# ----------------------------------------------------------------------------
 # Tools
 # ----------------------------------------------------------------------------
+
 
 @mcp.tool()
 async def price_history(ticker: str, range: str = "1y", interval: str = "1d") -> dict:
@@ -410,15 +653,82 @@ async def valuation(ticker: str) -> dict:
         }
 
 
+@mcp.tool()
+async def options_chain(ticker: str, window_days: int = 45,
+                        include_strikes: bool = False) -> dict:
+    """SURGE-ready options read: S3 gamma bin, R5 put/call short-proxy,
+    gamma ramp above spot, and a naive dealer-GEX estimate (UW-2 input).
+
+    Sources: CBOE delayed quotes PRIMARY (one unauthenticated call, all
+    expiries, dealer greeks included), Yahoo options FALLBACK (crumb-gated,
+    nearest 3 expiries, gamma computed via Black-Scholes from IV).
+
+    Args:
+        ticker: Symbol, e.g. "GME".
+        window_days: Expiry horizon for the derived metrics (default 45 —
+            squeeze mechanics live in near-dated contracts).
+        include_strikes: If True, also return near-the-money per-strike rows
+            (spot +/- 30%), capped at 60 rows. Default False — payloads are big.
+    Returns:
+        Derived SURGE fields plus a PIT note. Velocity-style reads (IV trend,
+        GEX flip) need day-over-day snapshots — archive this output daily for
+        any ticker under active monitoring.
+    """
+    sym = ticker.upper()
+    data = None
+    errors = []
+    for fetch in (_cboe_options, _yahoo_options):
+        try:
+            data = await fetch(sym)
+            break
+        except Exception as e:
+            errors.append(f"{fetch.__name__}: {type(e).__name__}")
+    if not data:
+        return {"ticker": sym, "found": False,
+                "note": f"No options data from CBOE or Yahoo ({'; '.join(errors)}). "
+                        "Ticker may have no listed options — note that no listed "
+                        "options also means S3 gamma scores 0 by definition."}
+
+    spot = data.get("spot")
+    if spot is None:
+        try:
+            q = await quote(sym)
+            spot = q.get("price")
+        except Exception:
+            pass
+
+    derived = _derive_options_read(spot, data["contracts"], window_days)
+    out = {
+        "ticker": sym, "found": True, "source": data["source"],
+        "spot": spot,
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **derived,
+        "pit_note": "PIT_NONE — this is a latest-value snapshot. IV trend (R5) "
+                    "and the GEX flip (UW-2) are day-over-day signals: archive "
+                    "daily for tickers under active monitoring.",
+    }
+    if include_strikes and spot:
+        rows = [k for k in data["contracts"]
+                if k.get("strike") and abs(k["strike"] - spot) / spot <= 0.30
+                and k["expiry"] in derived["expiries_in_window"]]
+        rows.sort(key=lambda k: (k["expiry"], k["strike"], k["type"]))
+        out["strikes"] = [{**{kk: vv for kk, vv in k.items() if kk != "gamma"},
+                           "iv_pct": round(k["iv"] * 100, 1) if k.get("iv") else None}
+                          for k in rows[:60]]
+        for row in out["strikes"]:
+            row.pop("iv", None)
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
-    print(f"[market-price] build-1 | dns_rebinding_protection="
+    print(f"[market-price] build-2-options | dns_rebinding_protection="
           f"{_security.enable_dns_rebinding_protection} | "
-          f"sources=yahoo-chart+stooq | "
+          f"sources=yahoo-chart+stooq+cboe-options | "
           f"transport={os.environ.get('MCP_TRANSPORT', 'stdio')}",
           file=sys.stderr, flush=True)
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
